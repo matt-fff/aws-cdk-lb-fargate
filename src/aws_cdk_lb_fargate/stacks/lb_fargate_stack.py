@@ -2,6 +2,8 @@
 from typing import Any, Generic, TypeVar
 from constructs import Construct
 from aws_cdk import (
+    Fn,
+    CfnOutput,
     Duration,
     Stack,
     aws_certificatemanager as acm,
@@ -17,7 +19,12 @@ from aws_cdk.aws_ecs_patterns import (
     ApplicationLoadBalancedFargateService as LBFargateService,
     ApplicationLoadBalancedTaskImageOptions as LBTaskImageOptions,
 )
-from aws_cdk_lb_fargate.configs import LBFargateConfig, DomainConfig
+from aws_cdk_lb_fargate.configs import (
+    LBFargateConfig,
+    DomainConfig,
+    ContainerImage,
+    ContainerImageSource,
+)
 
 # pylint: disable=invalid-name
 TConfig = TypeVar("TConfig", bound=LBFargateConfig)
@@ -39,35 +46,60 @@ class LBFargateStack(Stack, Generic[TConfig]):
     def __init__(
         self,
         scope: Construct,
-        construct_id: str,
+        config: TConfig,
         **kwargs,
     ) -> None:
-        self.construct_id = construct_id
-
+        self.construct_id = config.construct_id
         super().__init__(scope, self.construct_id, **kwargs)
 
+        vpc = self.vpc(config.vpc_id)
+        fargate = self.fargate(config, vpc)
+
+        CfnOutput(
+            self,
+            self._name("LoadBalancerDNS"),
+            value=fargate.load_balancer.load_balancer_dns_name,
+        )
+
+    def vpc(self, vpc_id: str | None) -> ec2.IVpc:
+        if vpc_id is not None:
+            return ec2.Vpc.from_lookup(
+                self,
+                self._name("VPC"),
+                vpc_id=vpc_id,
+            )
+
+        azs = Fn.get_azs()
+        return ec2.Vpc(self, self._name("VPC"), availability_zones=azs)
+
     def task_image_options(self, config: TConfig) -> LBTaskImageOptions:
-        container_image = self.container_image(config)
+        container_image = self.container_image(config.image)
 
         return LBTaskImageOptions(
             image=container_image,
-            container_port=config.port,
+            container_port=config.image.port,
             task_role=self.task_role(config),  # pyright: ignore
             environment=self.image_environment(config),
             secrets=self.image_secrets(config),
         )
 
-    def container_image(
-        self, config: TConfig  # pyright: ignore
-    ) -> ecs.ContainerImage:
-        container_repo = ecr.Repository.from_repository_name(
-            self, self._name("Repo"), config.image
-        )
+    def container_image(self, config: ContainerImage) -> ecs.ContainerImage:
+        if config.source == ContainerImageSource.ECR:
+            container_repo = ecr.Repository.from_repository_name(
+                self, self._name("Repo"), config.image
+            )
 
-        container_image = ecs.ContainerImage.from_ecr_repository(
-            container_repo, tag=config.image_tag
+            return ecs.ContainerImage.from_ecr_repository(
+                container_repo, tag=config.tag
+            )
+        if config.source == ContainerImageSource.REGISTRY:
+            return ecs.ContainerImage.from_registry(
+                f"{config.image}:{config.tag}"
+            )
+
+        raise NotImplementedError(
+            f"Unimplemented image source: {config.source}"
         )
-        return container_image
 
     def image_environment(self, config: TConfig) -> dict[str, Any]:
         return {}
@@ -118,10 +150,10 @@ class LBFargateStack(Stack, Generic[TConfig]):
         )
 
         # Without this, the health checks assume HTTPS
-        # and cause everything to fail/timeout
+        # is used internally and cause everything to fail/timeout
         fargate.target_group.configure_health_check(
             protocol=elbv2.Protocol.HTTP,
-            port=str(config.port),
+            port=str(config.image.port),
             path="/health",
         )
 
@@ -157,21 +189,20 @@ class LBFargateStack(Stack, Generic[TConfig]):
                 ),
             )
 
-            # Setup SSL certificate, if present
-            if domain.certificate_arn:
-                cert_name = self._name(f"{domain.name}Cert")
-                certs.append(
-                    acm.Certificate.from_certificate_arn(
-                        self, cert_name, domain.certificate_arn
-                    )
-                )
+            cert_name = self._name(f"{domain.name}Cert")
+            certificate = acm.Certificate(
+                self,
+                cert_name,
+                domain_name=domain.name,
+                validation=acm.CertificateValidation.from_dns(hosted_zone),
+            )
+            certs.append(certificate)
 
-                # Only bother setting these in the Fargate initialization
-                # if it's required. It's only required on HTTPS, so
-                # it's easier to only set them when HTTPS is involved
+            # Use the first domain as the primary.
+            if not fargate_domain_kwargs:
                 fargate_domain_kwargs = {
                     "domain_zone": hosted_zone,
-                    "certificate": certs[-1],
+                    "certificate": certificate,
                     "domain_name": domain.domain,
                 }
 
@@ -207,9 +238,11 @@ class LBFargateStack(Stack, Generic[TConfig]):
             )
 
             # If specified, allow access from this IP.
-            if config.whitelist_ip:
+            for ip_address in config.ip_allowlist:
                 lb_security_group.add_ingress_rule(
-                    ec2.Peer.ipv4(f"{config.whitelist_ip}/32"),
+                    ec2.Peer.ipv4(
+                        ip_address if "/" in ip_address else f"{ip_address}/32"
+                    ),
                     ec2.Port.tcp(port),
                     "developer access",
                 )
@@ -248,7 +281,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
         )
         ingress_sec_group.add_ingress_rule(
             ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            ec2.Port.tcp(config.port),
+            ec2.Port.tcp(config.image.port),
             "Allow http inbound from VPC",
         )
 

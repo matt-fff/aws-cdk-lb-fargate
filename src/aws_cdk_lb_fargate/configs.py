@@ -1,8 +1,15 @@
 import os
 from typing import Iterable
+from enum import Enum, unique
 
 
-from pydantic import BaseSettings, BaseModel
+from pydantic import BaseSettings, BaseModel, Field
+
+
+@unique
+class ContainerImageSource(Enum):
+    ECR = "ECR"
+    REGISTRY = "REGISTRY"
 
 
 class IngressConfig(BaseModel):
@@ -24,7 +31,6 @@ class SecretConfig(BaseModel):
 class DomainConfig(BaseModel):
     domain: str
     subdomain: str | None = None
-    certificate_arn: str | None = None
 
     @property
     def name(self):
@@ -39,27 +45,33 @@ class ScalingConfig(BaseModel):
     target_cpu_util_pct: float | int = 65
 
 
+class ContainerImage(BaseModel):
+    port: int
+    image: str
+    tag: str = "latest"
+    source: ContainerImageSource = ContainerImageSource.REGISTRY
+
+
 class LBFargateConfig(BaseSettings):
+    stack_name: str
     vpc_id: str
     env: str
     account: str
     region: str
-    port: int
-    image: str
-    image_tag: str = "latest"
-    whitelist_ip: str | None = None
+    image: ContainerImage
     public_access: bool = False
     scaling = ScalingConfig()
-    ingress_confs: list[IngressConfig] = []
-    domains: list[DomainConfig] = []
+    ip_allowlist: list[str] = Field(default_factory=list)
+    ingress_confs: list[IngressConfig] = Field(default_factory=list)
+    domains: list[DomainConfig] = Field(default_factory=list)
 
     @property
-    def certs(self) -> Iterable:
-        return (d.certificate_arn for d in self.domains if d)
+    def construct_id(self) -> str:
+        return f"{self.env.capitalize()}{self.stack_name}"
 
     @property
     def supports_https(self) -> bool:
-        return any(self.certs)
+        return any(self.domains)
 
     @property
     def external_ports(self) -> Iterable[int]:
