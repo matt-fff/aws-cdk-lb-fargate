@@ -31,6 +31,8 @@ class SecretConfig(BaseModel):
 class DomainConfig(BaseModel):
     domain: str
     subdomain: str | None = None
+    private_zone: bool = False
+    zone_exists: bool = False
 
     @property
     def name(self):

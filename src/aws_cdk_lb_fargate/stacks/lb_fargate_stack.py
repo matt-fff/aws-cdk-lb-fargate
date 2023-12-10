@@ -123,7 +123,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
         cluster = ecs.Cluster(self, self._name("Cluster"), vpc=vpc)
         load_balancer = self.load_balancer(config, vpc)
         fargate_domain_kwargs, certs = self.configure_domains(
-            load_balancer, config.domains
+            load_balancer, config.domains, vpc
         )
 
         if config.supports_https:
@@ -169,6 +169,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
         self,
         load_balancer: elbv2.ApplicationLoadBalancer,
         domains: list[DomainConfig],
+        vpc: ec2.IVpc,
     ) -> tuple[dict[str, Any], list[acm.Certificate]]:
         certs = []
         fargate_domain_kwargs: dict[str, Any] = {}
@@ -176,18 +177,22 @@ class LBFargateStack(Stack, Generic[TConfig]):
         for domain in domains:
             # Retrieve Route53 Alias Record to point to the Load Balancer
             zone_name = self._name(f"{domain.name}HostedZone")
-            hosted_zone = route53.HostedZone.from_lookup(
-                self, zone_name, domain_name=domain.domain
-            )
-            route53.ARecord(
-                self,
-                self._name(f"{domain.name}ARecord"),
-                zone=hosted_zone,
-                record_name=domain.name,
-                target=route53.RecordTarget.from_alias(
-                    route53_targets.LoadBalancerTarget(load_balancer)
-                ),
-            )
+
+            if domain.zone_exists:
+                hosted_zone = route53.HostedZone.from_lookup(
+                    self,
+                    zone_name,
+                    domain_name=domain.domain,
+                    private_zone=domain.private_zone,
+                    vpc_id=vpc.vpc_id if domain.private_zone else None,
+                )
+            else:
+                hosted_zone = route53.HostedZone(
+                    self,
+                    zone_name,
+                    zone_name=domain.domain,
+                    vpcs=[vpc] if domain.private_zone else [],
+                )
 
             cert_name = self._name(f"{domain.name}Cert")
             certificate = acm.Certificate(
@@ -203,8 +208,23 @@ class LBFargateStack(Stack, Generic[TConfig]):
                 fargate_domain_kwargs = {
                     "domain_zone": hosted_zone,
                     "certificate": certificate,
-                    "domain_name": domain.domain,
+                    "domain_name": domain.name,
                 }
+            else:
+                # Feels quite hacky, but this is necessary to support multiple.
+                # Domains linked to a single fargate service.
+                # The service will attempt to create an ARecord for its primary domain.
+                # That means we'll get a conflict when deploying because this stack
+                # is attempting to bootstrap 2 identical ARecords simultaneously
+                route53.ARecord(
+                    self,
+                    self._name(f"{domain.name}ARecord"),
+                    zone=hosted_zone,
+                    record_name=domain.name,
+                    target=route53.RecordTarget.from_alias(
+                        route53_targets.LoadBalancerTarget(load_balancer)
+                    ),
+                )
 
         return fargate_domain_kwargs, certs
 
