@@ -1,5 +1,5 @@
 # pylint: disable=unused-argument
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Iterable
 from constructs import Construct
 from aws_cdk import (
     Fn,
@@ -14,10 +14,6 @@ from aws_cdk import (
     aws_ecs as ecs,
     aws_iam as iam,
     aws_elasticloadbalancingv2 as elbv2,
-)
-from aws_cdk.aws_ecs_patterns import (
-    ApplicationLoadBalancedFargateService as LBFargateService,
-    ApplicationLoadBalancedTaskImageOptions as LBTaskImageOptions,
 )
 from aws_cdk_lb_fargate.configs import (
     LBFargateConfig,
@@ -54,11 +50,18 @@ class LBFargateStack(Stack, Generic[TConfig]):
 
         vpc = self.vpc(config.vpc_id)
         fargate = self.fargate(config, vpc)
+        self.configure_scaling(config, fargate)
+
+        load_balancer = self.load_balancer(config, vpc)
+        certs = self.configure_domains(load_balancer, config.domains, vpc)
+        self.configure_listeners(
+            config.external_ports, load_balancer, certs, fargate
+        )
 
         CfnOutput(
             self,
             self._name("LoadBalancerDNS"),
-            value=fargate.load_balancer.load_balancer_dns_name,
+            value=load_balancer.load_balancer_dns_name,
         )
 
     def vpc(self, vpc_id: str | None) -> ec2.IVpc:
@@ -72,16 +75,24 @@ class LBFargateStack(Stack, Generic[TConfig]):
         azs = Fn.get_azs()
         return ec2.Vpc(self, self._name("VPC"), availability_zones=azs)
 
-    def task_image_options(self, config: TConfig) -> LBTaskImageOptions:
-        container_image = self.container_image(config.image)
-
-        return LBTaskImageOptions(
-            image=container_image,
-            container_port=config.image.port,
+    def task_definition(self, config: TConfig) -> ecs.FargateTaskDefinition:
+        taskdef = ecs.FargateTaskDefinition(
+            self,
+            self._name("FargateTaskDef"),
             task_role=self.task_role(config),  # pyright: ignore
+        )
+
+        container = taskdef.add_container(
+            self._name("TaskContainer"),
+            image=self.container_image(config.image),
             environment=self.image_environment(config),
             secrets=self.image_secrets(config),
         )
+        container.add_port_mappings(
+            ecs.PortMapping(container_port=config.image.port, host_port=80)
+        )
+
+        return taskdef
 
     def container_image(self, config: ContainerImage) -> ecs.ContainerImage:
         if config.source == ContainerImageSource.ECR:
@@ -115,52 +126,21 @@ class LBFargateStack(Stack, Generic[TConfig]):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
 
-    def fargate(self, config: TConfig, vpc: ec2.IVpc) -> LBFargateService:
+    def fargate(self, config: TConfig, vpc: ec2.IVpc) -> ecs.FargateService:
         #
         # SETUP THE FARGATE SERVICE
         #
 
         cluster = ecs.Cluster(self, self._name("Cluster"), vpc=vpc)
-        load_balancer = self.load_balancer(config, vpc)
-        fargate_domain_kwargs, certs = self.configure_domains(
-            load_balancer, config.domains, vpc
-        )
-
-        if config.supports_https:
-            protocol = elbv2.ApplicationProtocol.HTTPS
-            redirect_http = True
-        else:
-            protocol = elbv2.ApplicationProtocol.HTTP
-            redirect_http = False
 
         # Create Fargate Service
-        fargate = LBFargateService(
+
+        fargate = ecs.FargateService(
             self,
             self._name("FargateService"),
             cluster=cluster,
-            open_listener=False,  # Openness is managed in the load balancer
-            target_protocol=elbv2.ApplicationProtocol.HTTP,
-            load_balancer=load_balancer,
-            assign_public_ip=True,
-            task_image_options=self.task_image_options(config),
+            task_definition=self.task_definition(config),
             security_groups=self.security_groups(config, vpc),
-            protocol=protocol,
-            redirect_http=redirect_http,
-            **fargate_domain_kwargs,
-        )
-
-        # Without this, the health checks assume HTTPS
-        # is used internally and cause everything to fail/timeout
-        fargate.target_group.configure_health_check(
-            protocol=elbv2.Protocol.HTTP,
-            port=str(config.image.port),
-            path="/health",
-        )
-
-        self.configure_scaling(config, fargate)
-
-        load_balancer.listeners[0].add_certificates(
-            self._name("FargateLBCerts"), certificates=certs
         )
 
         return fargate
@@ -170,9 +150,8 @@ class LBFargateStack(Stack, Generic[TConfig]):
         load_balancer: elbv2.ApplicationLoadBalancer,
         domains: list[DomainConfig],
         vpc: ec2.IVpc,
-    ) -> tuple[dict[str, Any], list[acm.Certificate]]:
+    ) -> list[acm.ICertificate]:
         certs = []
-        fargate_domain_kwargs: dict[str, Any] = {}
         # Setup certificates and zones
         for domain in domains:
             # Retrieve Route53 Alias Record to point to the Load Balancer
@@ -203,36 +182,23 @@ class LBFargateStack(Stack, Generic[TConfig]):
             )
             certs.append(certificate)
 
-            # Use the first domain as the primary.
-            if not fargate_domain_kwargs:
-                fargate_domain_kwargs = {
-                    "domain_zone": hosted_zone,
-                    "certificate": certificate,
-                    "domain_name": domain.name,
-                }
-            else:
-                # Feels quite hacky, but this is necessary to support multiple.
-                # Domains linked to a single fargate service.
-                # The service will attempt to create an ARecord for its primary domain.
-                # That means we'll get a conflict when deploying because this stack
-                # is attempting to bootstrap 2 identical ARecords simultaneously
-                route53.ARecord(
-                    self,
-                    self._name(f"{domain.name}ARecord"),
-                    zone=hosted_zone,
-                    record_name=domain.name,
-                    target=route53.RecordTarget.from_alias(
-                        route53_targets.LoadBalancerTarget(load_balancer)
-                    ),
-                )
+            route53.ARecord(
+                self,
+                self._name(f"{domain.name}ARecord"),
+                zone=hosted_zone,
+                record_name=domain.name,
+                target=route53.RecordTarget.from_alias(
+                    route53_targets.LoadBalancerTarget(load_balancer)
+                ),
+            )
 
-        return fargate_domain_kwargs, certs
+        return certs
 
     def configure_scaling(
-        self, config: TConfig, fargate: LBFargateService
+        self, config: TConfig, fargate: ecs.FargateService
     ) -> None:
         # Setup AutoScaling policy
-        scaling = fargate.service.auto_scale_task_count(
+        scaling = fargate.auto_scale_task_count(
             max_capacity=config.scaling.max_task_count
         )
         scaling.scale_on_cpu_utilization(
@@ -241,6 +207,28 @@ class LBFargateStack(Stack, Generic[TConfig]):
             scale_in_cooldown=Duration.seconds(60),
             scale_out_cooldown=Duration.seconds(60),
         )
+
+    def configure_listeners(
+        self,
+        external_ports: Iterable[int],
+        load_balancer: elbv2.ApplicationLoadBalancer,
+        certs: list[acm.ICertificate],
+        fargate: ecs.FargateService,
+    ):
+        for port in external_ports:
+            listener_name = f"Listener{port}"
+            listener = load_balancer.add_listener(
+                self._name(listener_name), port=port
+            )
+            listener.add_certificates(
+                self._name(f"{listener_name}Certs"), certs
+            )
+            listener.add_targets(
+                f"{listener_name}Target",
+                port=80,  # Intentional: HTTPS terminates at the balancer
+                targets=[fargate],
+            )
+            # TODO healthcheck
 
     def load_balancer(
         self, config: TConfig, vpc: ec2.IVpc
