@@ -2,12 +2,12 @@
 
 import aws_cdk as cdk
 
-from aws_cdk_lb_fargate.aws_cdk_lb_fargate_stack import AwsCdkLbFargateStack
-from aws_cdk_lb_fargate.config import config
+from nimbus_lib.nimbus_stack import NimbusStack
+from nimbus_lib.config import config
 
 
 app = cdk.App()
 env = cdk.Environment(account=config.account, region=config.region)
-AwsCdkLbFargateStack(app, config, env=env)
+NimbusStack(app, config, env=env)
 
 app.synth()

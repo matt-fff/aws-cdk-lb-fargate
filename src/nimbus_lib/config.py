@@ -1,7 +1,7 @@
-from aws_cdk_lb_fargate.configs import LBFargateConfig
+from nimbus_lib.configs import FargateConfig
 
 
-class Config(LBFargateConfig):
+class Config(FargateConfig):
     # Put custom configuration here.
     pass
 

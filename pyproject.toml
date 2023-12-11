@@ -1,7 +1,7 @@
 [project]
-name = "aws-cdk-lb-fargate"
+name = "nimbus-lib"
 version = "0.1.0"
-description = "Boilerplate repository to take any docker image and deploy it to the cloud with the AWS CDK."
+description = "Library wrapping AWS CDK primitives in a useful way."
 authors = [
     { name = "Matt White", email = "mail@matt-w.net" }
 ]

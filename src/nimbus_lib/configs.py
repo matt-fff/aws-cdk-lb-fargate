@@ -47,25 +47,34 @@ class ScalingConfig(BaseModel):
     target_cpu_util_pct: float | int = 65
 
 
-class ContainerImage(BaseModel):
+class ContainerConfig(BaseModel):
     port: int
     image: str
     tag: str = "latest"
     source: ContainerImageSource = ContainerImageSource.REGISTRY
+    volumes: list[str] = Field(default_factory=list)
+    command: str | None = None
 
 
-class LBFargateConfig(BaseSettings):
+class FargateConfig(BaseSettings):
     stack_name: str
     vpc_id: str
     env: str
     account: str
     region: str
-    image: ContainerImage
+    container: ContainerConfig
     public_access: bool = False
-    scaling = ScalingConfig()
+    scaling: ScalingConfig = ScalingConfig()
     ip_allowlist: list[str] = Field(default_factory=list)
     ingress_confs: list[IngressConfig] = Field(default_factory=list)
     domains: list[DomainConfig] = Field(default_factory=list)
+
+    external_http_port: int = 80
+    external_https_port: int = 443
+
+    @property
+    def use_efs(self) -> bool:
+        return len(self.container.volumes) > 0
 
     @property
     def construct_id(self) -> str:
@@ -78,8 +87,8 @@ class LBFargateConfig(BaseSettings):
     @property
     def external_ports(self) -> Iterable[int]:
         if self.supports_https:
-            return (80, 443)
-        return (80,)
+            return (self.external_http_port, self.external_https_port)
+        return (self.external_http_port,)
 
     class Config:
         case_sensitive = False
@@ -92,4 +101,12 @@ class LBFargateConfig(BaseSettings):
         env_nested_delimiter = "__"
 
 
-__all__ = ["LBFargateConfig", "SecretConfig", "IngressConfig"]
+__all__ = [
+    "ContainerImageSource",
+    "DomainConfig",
+    "ScalingConfig",
+    "ContainerConfig",
+    "FargateConfig",
+    "SecretConfig",
+    "IngressConfig",
+]

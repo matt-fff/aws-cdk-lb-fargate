@@ -1,5 +1,5 @@
 # pylint: disable=unused-argument
-from typing import Any, Generic, TypeVar, Iterable
+from typing import Any, Generic, TypeVar
 from constructs import Construct
 from aws_cdk import (
     Fn,
@@ -9,24 +9,20 @@ from aws_cdk import (
     aws_certificatemanager as acm,
     aws_route53 as route53,
     aws_route53_targets as route53_targets,
+    aws_efs as efs,
     aws_ec2 as ec2,
     aws_ecr as ecr,
     aws_ecs as ecs,
     aws_iam as iam,
     aws_elasticloadbalancingv2 as elbv2,
 )
-from aws_cdk_lb_fargate.configs import (
-    LBFargateConfig,
-    DomainConfig,
-    ContainerImage,
-    ContainerImageSource,
-)
+from nimbus_lib import configs as conf
 
 # pylint: disable=invalid-name
-TConfig = TypeVar("TConfig", bound=LBFargateConfig)
+TConfig = TypeVar("TConfig", bound=conf.FargateConfig)
 
 
-class LBFargateStack(Stack, Generic[TConfig]):
+class FargateStack(Stack, Generic[TConfig]):
     @property
     def _base_name(self) -> str:
         return self.construct_id
@@ -50,12 +46,15 @@ class LBFargateStack(Stack, Generic[TConfig]):
 
         vpc = self.vpc(config.vpc_id)
         fargate = self.fargate(config, vpc)
-        self.configure_scaling(config, fargate)
+        self.setup_scaling(config, fargate)
 
         load_balancer = self.load_balancer(config, vpc)
-        certs = self.configure_domains(load_balancer, config.domains, vpc)
-        self.configure_listeners(
-            config.external_ports, load_balancer, certs, fargate
+        certs = self.setup_domains(load_balancer, config.domains, vpc)
+        self.setup_listeners(
+            config,
+            load_balancer,
+            certs,
+            fargate,
         )
 
         CfnOutput(
@@ -75,27 +74,104 @@ class LBFargateStack(Stack, Generic[TConfig]):
         azs = Fn.get_azs()
         return ec2.Vpc(self, self._name("VPC"), availability_zones=azs)
 
-    def task_definition(self, config: TConfig) -> ecs.FargateTaskDefinition:
-        taskdef = ecs.FargateTaskDefinition(
-            self,
-            self._name("FargateTaskDef"),
-            task_role=self.task_role(config),  # pyright: ignore
-        )
+    def setup_container(
+        self,
+        config: TConfig,
+        taskdef: ecs.FargateTaskDefinition,
+    ) -> ecs.ContainerDefinition:
+        command = None
+        if config.container.command:
+            command = config.container.command.split(" ")
 
         container = taskdef.add_container(
             self._name("TaskContainer"),
-            image=self.container_image(config.image),
+            image=self.container_image(config.container),
             environment=self.image_environment(config),
             secrets=self.image_secrets(config),
+            command=command,
         )
         container.add_port_mappings(
-            ecs.PortMapping(container_port=config.image.port, host_port=80)
+            ecs.PortMapping(container_port=config.container.port)
         )
+
+        return container
+
+    def efs_filesystem(
+        self,
+        vpc: ec2.IVpc,
+        fargate_sg: ec2.SecurityGroup,
+    ) -> efs.FileSystem:
+        filesys_sg = ec2.SecurityGroup(
+            self,
+            self._name("FileSystemSecGrp"),
+            vpc=vpc,
+        )
+        filesys_sg.add_ingress_rule(
+            fargate_sg,
+            ec2.Port.tcp(2049),
+        )
+
+        # Create an EFS file system
+        file_system = efs.FileSystem(
+            self,
+            self._name("FileSystem"),
+            vpc=vpc,
+            performance_mode=efs.PerformanceMode.GENERAL_PURPOSE,
+            security_group=filesys_sg,
+        )
+
+        return file_system
+
+    def setup_container_volumes(
+        self,
+        config: TConfig,
+        taskdef: ecs.FargateTaskDefinition,
+        container: ecs.ContainerDefinition,
+        file_system: efs.FileSystem,
+    ) -> None:
+        # Create all volumes and corresponding mount points
+        for idx, container_path in enumerate(config.container.volumes):
+            volume_name = f"vol-{idx}"
+            taskdef.add_volume(
+                name=volume_name,
+                efs_volume_configuration=ecs.EfsVolumeConfiguration(
+                    file_system_id=file_system.file_system_id,
+                    transit_encryption="ENABLED",
+                ),
+            )
+            container.add_mount_points(
+                ecs.MountPoint(
+                    source_volume=volume_name,
+                    read_only=False,
+                    container_path=container_path,
+                )
+            )
+
+    def task_definition(
+        self, config: TConfig, vpc: ec2.IVpc, fargate_sg: ec2.SecurityGroup
+    ) -> ecs.FargateTaskDefinition:
+        taskdef = ecs.FargateTaskDefinition(
+            self,
+            self._name("FargateTaskDef"),
+            # Pyright ignore is necessary due to inconsistencies in
+            # parameter naming ("grantee" vs "identity"), not types.
+            task_role=self.task_role(config),  # pyright: ignore
+            execution_role=self.task_execution_role(config),  # pyright: ignore
+        )
+
+        container = self.setup_container(config, taskdef)
+        if config.use_efs:
+            file_system = self.efs_filesystem(vpc, fargate_sg)
+            self.setup_container_volumes(
+                config, taskdef, container, file_system
+            )
 
         return taskdef
 
-    def container_image(self, config: ContainerImage) -> ecs.ContainerImage:
-        if config.source == ContainerImageSource.ECR:
+    def container_image(
+        self, config: conf.ContainerConfig
+    ) -> ecs.ContainerImage:
+        if config.source == conf.ContainerImageSource.ECR:
             container_repo = ecr.Repository.from_repository_name(
                 self, self._name("Repo"), config.image
             )
@@ -103,7 +179,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
             return ecs.ContainerImage.from_ecr_repository(
                 container_repo, tag=config.tag
             )
-        if config.source == ContainerImageSource.REGISTRY:
+        if config.source == conf.ContainerImageSource.REGISTRY:
             return ecs.ContainerImage.from_registry(
                 f"{config.image}:{config.tag}"
             )
@@ -126,6 +202,33 @@ class LBFargateStack(Stack, Generic[TConfig]):
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
         )
 
+    def task_execution_role(self, config: TConfig) -> iam.Role:
+        # Setup role permissions
+        role = iam.Role(
+            self,
+            self._name("TaskExecutionRole"),
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+
+        # Add necessary permissions to the IAM role
+        role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AmazonECSTaskExecutionRolePolicy"
+            )
+        )
+
+        if config.use_efs:
+            role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "elasticfilesystem:CreateMountTarget",
+                    ],
+                    resources=["*"],  # TODO get more specific
+                )
+            )
+
+        return role
+
     def fargate(self, config: TConfig, vpc: ec2.IVpc) -> ecs.FargateService:
         #
         # SETUP THE FARGATE SERVICE
@@ -135,20 +238,25 @@ class LBFargateStack(Stack, Generic[TConfig]):
 
         # Create Fargate Service
 
+        fargate_ingress_sg, fargate_egress_sg = self.fargate_security_groups(
+            config, vpc
+        )
         fargate = ecs.FargateService(
             self,
             self._name("FargateService"),
             cluster=cluster,
-            task_definition=self.task_definition(config),
-            security_groups=self.security_groups(config, vpc),
+            task_definition=self.task_definition(
+                config, vpc, fargate_egress_sg
+            ),
+            security_groups=[fargate_ingress_sg, fargate_egress_sg],
         )
 
         return fargate
 
-    def configure_domains(
+    def setup_domains(
         self,
         load_balancer: elbv2.ApplicationLoadBalancer,
-        domains: list[DomainConfig],
+        domains: list[conf.DomainConfig],
         vpc: ec2.IVpc,
     ) -> list[acm.ICertificate]:
         certs = []
@@ -194,7 +302,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
 
         return certs
 
-    def configure_scaling(
+    def setup_scaling(
         self, config: TConfig, fargate: ecs.FargateService
     ) -> None:
         # Setup AutoScaling policy
@@ -208,26 +316,28 @@ class LBFargateStack(Stack, Generic[TConfig]):
             scale_out_cooldown=Duration.seconds(60),
         )
 
-    def configure_listeners(
+    def setup_listeners(
         self,
-        external_ports: Iterable[int],
+        config: TConfig,
         load_balancer: elbv2.ApplicationLoadBalancer,
         certs: list[acm.ICertificate],
         fargate: ecs.FargateService,
     ):
-        for port in external_ports:
+        for port in config.external_ports:
             listener_name = f"Listener{port}"
             listener = load_balancer.add_listener(
                 self._name(listener_name), port=port
             )
-            listener.add_certificates(
-                self._name(f"{listener_name}Certs"), certs
-            )
             listener.add_targets(
                 f"{listener_name}Target",
-                port=80,  # Intentional: HTTPS terminates at the balancer
+                port=config.container.port,  # HTTPS terminates at the balancer
                 targets=[fargate],
             )
+
+            if port == config.external_https_port:
+                listener.add_certificates(
+                    self._name(f"{listener_name}Certs"), certs
+                )
             # TODO healthcheck
 
     def load_balancer(
@@ -235,7 +345,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
     ) -> elbv2.ApplicationLoadBalancer:
         # Create a Security Group for the Load Balancer
         lb_security_group = ec2.SecurityGroup(
-            self, self._name("LBSecurityGroup"), vpc=vpc
+            self, self._name("LBSecGrp"), vpc=vpc
         )
 
         for port in config.external_ports:
@@ -248,9 +358,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
             # If specified, allow access from this IP.
             for ip_address in config.ip_allowlist:
                 lb_security_group.add_ingress_rule(
-                    ec2.Peer.ipv4(
-                        ip_address if "/" in ip_address else f"{ip_address}/32"
-                    ),
+                    ec2.Peer.ipv4(ip_address),
                     ec2.Port.tcp(port),
                     "developer access",
                 )
@@ -273,7 +381,9 @@ class LBFargateStack(Stack, Generic[TConfig]):
 
         return load_balancer
 
-    def security_groups(self, config: TConfig, vpc: ec2.IVpc):
+    def fargate_security_groups(
+        self, config: TConfig, vpc: ec2.IVpc
+    ) -> tuple[ec2.SecurityGroup, ec2.SecurityGroup]:
         #
         # SECURITY GROUPS AND NETWORKING
         #
@@ -281,7 +391,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
         # Setup incoming access
         ingress_sec_group = ec2.SecurityGroup(
             self,
-            self._name("FargateIngressSecGroup"),
+            self._name("FargateIngressSecGrp"),
             vpc=vpc,
             description=(
                 "Security group to link to other AWS resource security groups"
@@ -289,14 +399,14 @@ class LBFargateStack(Stack, Generic[TConfig]):
         )
         ingress_sec_group.add_ingress_rule(
             ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            ec2.Port.tcp(config.image.port),
+            ec2.Port.tcp(config.container.port),
             "Allow http inbound from VPC",
         )
 
         # Setup access to AWS resources
         egress_sec_group = ec2.SecurityGroup(
             self,
-            self._name("FargateEgressSecGroup"),
+            self._name("FargateEgressSecGrp"),
             vpc=vpc,
             description=(
                 "Security group to link to other AWS resource security groups"
@@ -307,7 +417,7 @@ class LBFargateStack(Stack, Generic[TConfig]):
         for idx, ingress in enumerate(config.ingress_confs):
             conf_security_group = ec2.SecurityGroup.from_security_group_id(
                 self,
-                self._name(f"IngressSecurityGroup{idx}"),
+                self._name(f"IngressSecGrp{idx}"),
                 security_group_id=ingress.security_group_id,
             )
             conf_security_group.add_ingress_rule(
@@ -315,4 +425,4 @@ class LBFargateStack(Stack, Generic[TConfig]):
                 ec2.Port.tcp(ingress.port),
             )
 
-        return [ingress_sec_group, egress_sec_group]
+        return ingress_sec_group, egress_sec_group
