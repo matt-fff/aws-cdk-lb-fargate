@@ -7,6 +7,7 @@
 #   all-features: false
 
 -e file:.
+annotated-types==0.6.0
 astroid==2.15.8
 asttokens==2.4.1
 attrs==23.1.0
@@ -52,7 +53,9 @@ ptyprocess==0.7.0
 publication==0.0.3
 pure-eval==0.2.2
 pycodestyle==2.9.1
-pydantic==1.10.13
+pydantic==2.5.2
+pydantic-core==2.14.5
+pydantic-settings==2.1.0
 pyflakes==2.5.0
 pygments==2.17.2
 pylint==2.17.7

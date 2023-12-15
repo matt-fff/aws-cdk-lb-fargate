@@ -7,6 +7,7 @@
 #   all-features: false
 
 -e file:.
+annotated-types==0.6.0
 attrs==23.1.0
 aws-cdk-asset-awscli-v1==2.2.201
 aws-cdk-asset-kubectl-v20==2.1.2
@@ -18,7 +19,9 @@ exceptiongroup==1.2.0
 importlib-resources==6.1.1
 jsii==1.92.0
 publication==0.0.3
-pydantic==1.10.13
+pydantic==2.5.2
+pydantic-core==2.14.5
+pydantic-settings==2.1.0
 python-dateutil==2.8.2
 python-dotenv==1.0.0
 six==1.16.0
