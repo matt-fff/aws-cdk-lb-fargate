@@ -32,7 +32,7 @@ class DomainConfig(BaseModel):
     domain: str
     subdomain: str | None = None
     private_zone: bool = False
-    zone_exists: bool = False
+    create_zone: bool = True
 
     @property
     def name(self):
@@ -47,12 +47,17 @@ class ScalingConfig(BaseModel):
     target_cpu_util_pct: float | int = 65
 
 
+class VolumeConfig(BaseModel):
+    path: str
+    filesys_id: str | None = None
+
+
 class ContainerConfig(BaseModel):
     port: int
     image: str
     tag: str = "latest"
     source: ContainerImageSource = ContainerImageSource.REGISTRY
-    volumes: list[str] = Field(default_factory=list)
+    volumes: list[VolumeConfig] = Field(default_factory=list)
     command: str | None = None
 
 

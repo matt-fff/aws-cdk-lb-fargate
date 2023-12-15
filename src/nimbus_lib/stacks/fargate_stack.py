@@ -100,37 +100,56 @@ class FargateStack(Stack, Generic[TConfig]):
         self,
         vpc: ec2.IVpc,
         fargate_sg: ec2.SecurityGroup,
-    ) -> efs.FileSystem:
+        filesystem_id: str | None = None,
+    ) -> efs.IFileSystem:
         filesys_sg = ec2.SecurityGroup(
             self,
             self._name("FileSystemSecGrp"),
             vpc=vpc,
         )
+        # Give the fargate service access
         filesys_sg.add_ingress_rule(
             fargate_sg,
             ec2.Port.tcp(2049),
         )
 
-        # Create an EFS file system
-        file_system = efs.FileSystem(
-            self,
-            self._name("FileSystem"),
-            vpc=vpc,
-            performance_mode=efs.PerformanceMode.GENERAL_PURPOSE,
-            security_group=filesys_sg,
-        )
+        if filesystem_id is None:
+            # Create an EFS file system
+            file_system = efs.FileSystem(
+                self,
+                self._name("FileSystem"),
+                vpc=vpc,
+                performance_mode=efs.PerformanceMode.GENERAL_PURPOSE,
+                security_group=filesys_sg,
+            )
+        else:
+            file_system = efs.FileSystem.from_file_system_attributes(
+                self,
+                self._name("FileSystem"),
+                file_system_id=filesystem_id,
+                security_group=filesys_sg,
+            )
 
         return file_system
 
+    # pylint: disable=too-many-arguments
     def setup_container_volumes(
         self,
         config: TConfig,
+        vpc: ec2.IVpc,
+        fargate_sg: ec2.SecurityGroup,
         taskdef: ecs.FargateTaskDefinition,
         container: ecs.ContainerDefinition,
-        file_system: efs.FileSystem,
     ) -> None:
+        filesystems = {}
+
         # Create all volumes and corresponding mount points
-        for idx, container_path in enumerate(config.container.volumes):
+        for idx, volume_config in enumerate(config.container.volumes):
+            file_system = filesystems.setdefault(
+                volume_config.filesys_id,
+                self.efs_filesystem(vpc, fargate_sg, volume_config.filesys_id),
+            )
+
             volume_name = f"vol-{idx}"
             taskdef.add_volume(
                 name=volume_name,
@@ -143,7 +162,7 @@ class FargateStack(Stack, Generic[TConfig]):
                 ecs.MountPoint(
                     source_volume=volume_name,
                     read_only=False,
-                    container_path=container_path,
+                    container_path=volume_config.path,
                 )
             )
 
@@ -161,9 +180,8 @@ class FargateStack(Stack, Generic[TConfig]):
 
         container = self.setup_container(config, taskdef)
         if config.use_efs:
-            file_system = self.efs_filesystem(vpc, fargate_sg)
             self.setup_container_volumes(
-                config, taskdef, container, file_system
+                config, vpc, fargate_sg, taskdef, container
             )
 
         return taskdef
@@ -265,20 +283,20 @@ class FargateStack(Stack, Generic[TConfig]):
             # Retrieve Route53 Alias Record to point to the Load Balancer
             zone_name = self._name(f"{domain.name}HostedZone")
 
-            if domain.zone_exists:
+            if domain.create_zone:
+                hosted_zone = route53.HostedZone(
+                    self,
+                    zone_name,
+                    zone_name=domain.domain,
+                    vpcs=[vpc] if domain.private_zone else None,
+                )
+            else:
                 hosted_zone = route53.HostedZone.from_lookup(
                     self,
                     zone_name,
                     domain_name=domain.domain,
                     private_zone=domain.private_zone,
                     vpc_id=vpc.vpc_id if domain.private_zone else None,
-                )
-            else:
-                hosted_zone = route53.HostedZone(
-                    self,
-                    zone_name,
-                    zone_name=domain.domain,
-                    vpcs=[vpc] if domain.private_zone else [],
                 )
 
             cert_name = self._name(f"{domain.name}Cert")
@@ -326,7 +344,7 @@ class FargateStack(Stack, Generic[TConfig]):
         for port in config.external_ports:
             listener_name = f"Listener{port}"
             listener = load_balancer.add_listener(
-                self._name(listener_name), port=port
+                self._name(listener_name), port=port, open=False
             )
             listener.add_targets(
                 f"{listener_name}Target",
@@ -358,7 +376,9 @@ class FargateStack(Stack, Generic[TConfig]):
             # If specified, allow access from this IP.
             for ip_address in config.ip_allowlist:
                 lb_security_group.add_ingress_rule(
-                    ec2.Peer.ipv4(ip_address),
+                    ec2.Peer.ipv4(
+                        ip_address if "/" in ip_address else f"{ip_address}/32"
+                    ),
                     ec2.Port.tcp(port),
                     "developer access",
                 )
