@@ -16,24 +16,17 @@ from aws_cdk import (
     aws_iam as iam,
     aws_elasticloadbalancingv2 as elbv2,
 )
-from nimbus_lib import configs as conf
+from nimbus_lib import config as confs
+from .nameable import Nameable
 
 # pylint: disable=invalid-name
-TConfig = TypeVar("TConfig", bound=conf.FargateConfig)
+TConfig = TypeVar("TConfig", bound=confs.FargateConfig)
 
 
-class FargateStack(Stack, Generic[TConfig]):
+class FargateStack(Stack, Nameable, Generic[TConfig]):
     @property
     def _base_name(self) -> str:
         return self.construct_id
-
-    def _name(self, suffix: str = "", prefix: str = "") -> str:
-        return "".join(
-            [
-                part[0].upper() + part[1:]
-                for part in f"{prefix} {self._base_name} {suffix}".split()
-            ]
-        )
 
     def __init__(
         self,
@@ -187,9 +180,9 @@ class FargateStack(Stack, Generic[TConfig]):
         return taskdef
 
     def container_image(
-        self, config: conf.ContainerConfig
+        self, config: confs.ContainerConfig
     ) -> ecs.ContainerImage:
-        if config.source == conf.ContainerImageSource.ECR:
+        if config.source == confs.ContainerImageSource.ECR:
             container_repo = ecr.Repository.from_repository_name(
                 self, self._name("Repo"), config.image
             )
@@ -197,7 +190,7 @@ class FargateStack(Stack, Generic[TConfig]):
             return ecs.ContainerImage.from_ecr_repository(
                 container_repo, tag=config.tag
             )
-        if config.source == conf.ContainerImageSource.REGISTRY:
+        if config.source == confs.ContainerImageSource.REGISTRY:
             return ecs.ContainerImage.from_registry(
                 f"{config.image}:{config.tag}"
             )
@@ -274,7 +267,7 @@ class FargateStack(Stack, Generic[TConfig]):
     def setup_domains(
         self,
         load_balancer: elbv2.ApplicationLoadBalancer,
-        domains: list[conf.DomainConfig],
+        domains: list[confs.DomainConfig],
         vpc: ec2.IVpc,
     ) -> list[acm.ICertificate]:
         certs = []
