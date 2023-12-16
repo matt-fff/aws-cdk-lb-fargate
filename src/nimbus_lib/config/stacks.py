@@ -55,6 +55,15 @@ class RdsConfig(StackConfig):
     )
 
 
+class BastionConfig(StackConfig):
+    vpc_id: str
+    key_pair_name: str
+    ssh_port: int = 22
+    bootstrap_script: str | None = None
+    ip_allowlist: list[str] = Field(default_factory=list)
+    ingress_confs: list[comps.IngressConfig] = Field(default_factory=list)
+
+
 class FargateConfig(StackConfig):
     vpc_id: str
     container: comps.ContainerConfig

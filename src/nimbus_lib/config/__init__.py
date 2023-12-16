@@ -7,7 +7,7 @@ from .components import (
     IngressConfig,
     SubnetConfig,
 )
-from .stacks import VpcConfig, FargateConfig, RdsConfig
+from .stacks import VpcConfig, FargateConfig, RdsConfig, BastionConfig
 
 
 __all__ = [
@@ -21,4 +21,5 @@ __all__ = [
     "VpcConfig",
     "FargateConfig",
     "RdsConfig",
+    "BastionConfig",
 ]
