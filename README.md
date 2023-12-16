@@ -2,6 +2,18 @@
 
 Library for wrapping AWS CDK primitives in a useful way.
 
+## VpcStack
+A CDK stack to create a Virtual Private Cloud.
+
+## RdsStack
+A CDK stack that generates an RDS Database Instance
+
+## BastionStack
+A CDK stack that generates a Bastion host using EC2. 
+
+* Allowlist of IP addresses (i.e. for you or your team to be able to ssh into the host).
+* Updating arbitrary security groups to allow ingress from the bastion host (e.g. so that you can use an SSH tunnel through the host to access an AWS database).
+
 ## FargateStack
 Configurable CDK stack to take a docker image and deploy it to the cloud with the AWS CDK. 
 Intended to be subclassed
