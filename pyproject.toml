@@ -1,6 +1,6 @@
 [project]
 name = "nimbus-lib"
-version = "0.1.0"
+version = "0.1.1rc0"
 description = "Library wrapping AWS CDK primitives in a useful way."
 authors = [
     { name = "Matt White", email = "mail@matt-w.net" }
